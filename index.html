@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="暮色世界玩家 Wiki：查询技能、职业导师、任务向导、词缀及客户端资料来源。">
+  <meta name="theme-color" content="#111827">
+  <title>暮色世界 Wiki · 技能资料</title>
+  <link rel="stylesheet" href="./wiki.css">
+  <script id="wiki-script" src="./wiki.js" defer onerror="document.documentElement.dataset.scriptError='true'"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到资料内容</a>
+  <div class="site-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#guide">暮色世界 <span>Wiki</span></a>
+      <p class="sidebar-description">技能、导师与任务的查询手册</p>
+      <nav aria-label="资料分类" id="navigation">
+        <a href="#spells" data-page="spells">技能资料 <span id="nav-spells"></span></a>
+        <a href="#trainers" data-page="trainers">职业与专精导师</a>
+        <a href="#quests" data-page="quests">任务向导</a>
+        <a href="#modifiers" data-page="modifiers">词缀与附魔</a>
+        <a href="#items" data-page="items">物品图标</a>
+        <a href="#maps" data-page="maps">地图资料</a>
+        <div class="nav-divider"></div>
+        <a href="#guide" data-page="guide">新手阅读指南</a>
+        <a href="#sources" data-page="sources">数据来源与范围</a>
+      </nav>
+      <div class="sidebar-foot"><span>客户端 build 10149</span><p>静态资料 · 无需游戏账号</p></div>
+    </aside>
+    <main id="main" tabindex="-1">
+      <header class="page-header"><div><h1 id="page-title">技能资料</h1><p id="page-description">查名字、看消耗与射程，再核对来源。</p></div><a class="header-link" href="#sources">资料范围</a></header>
+      <p class="scope-note"><strong>客户端展示资料</strong>不代表服务器已开放或角色已学会。技能“等级”是技能文字，不是人物学习等级。</p>
+      <div class="load-state"><p id="status" role="status" aria-live="polite">正在启动资料库…</p><button id="retry" type="button" hidden>重新读取</button></div>
+      <noscript><p class="scope-note">请启用 JavaScript 后重新加载，才能查询资料。</p></noscript>
+      <section id="reader" class="reader" hidden></section>
+      <section id="browser" aria-label="资料查询">
+        <form class="toolbar" id="search-form" role="search">
+          <label class="search-field"><span>搜索资料</span><input id="query" type="search" placeholder="名称、ID、说明或来源，例如：火球术 133" autocomplete="off"></label>
+          <label id="filter-label" hidden><span id="filter-title">类型</span><select id="filter"><option value="all">全部</option></select></label>
+          <label class="check-field" id="spell-options"><input id="full-index" type="checkbox"><span>包含完整技能索引</span></label>
+          <label class="page-size-field"><span>每页</span><select id="page-size"><option value="30">30 条</option><option value="60">60 条</option><option value="100">100 条</option></select></label>
+        </form>
+        <div class="catalog-layout">
+          <section class="record-list" aria-label="查询结果">
+            <div class="list-top"><strong id="result-count">资料尚未读取</strong><span id="list-hint">默认只列有详细技能书记录的技能</span></div>
+            <ul id="results"></ul>
+            <nav class="pagination" aria-label="结果分页"><button id="previous" type="button" disabled>上一页</button><span id="page-info">—</span><button id="next" type="button" disabled>下一页</button></nav>
+          </section>
+          <article class="record-detail" id="detail" aria-label="资料详情" tabindex="-1"><h2>选择一条资料</h2><p class="muted">在左侧查询结果中选一条，查看说明、数值与地点。</p></article>
+        </div>
+      </section>
+      <footer>缺失字段显示“未提供”。0、否和源数据的空字符串保留区别。图标来自客户端，部分技能复用同一通用图标。</footer>
+    </main>
+  </div>
+  <script>
+  (function(){
+    const root=document.documentElement;if(!root.dataset.wikiState)root.dataset.wikiState='booting';
+    function failed(message){if(root.dataset.wikiState==='ready')return;root.dataset.wikiState='failed';document.getElementById('status').textContent=message;document.getElementById('status').className='error';document.getElementById('retry').hidden=false;}
+    document.getElementById('retry').addEventListener('click',()=>{if(!window.DuskWiki?.retry)window.location.reload();});
+    window.addEventListener('error',event=>{if(event.target?.id==='wiki-script'||/\/wiki\.js(?:\?|$)/.test(event.filename||''))failed('资料库脚本加载失败，请重新加载页面。');},true);
+    if(root.dataset.scriptError)failed('资料库脚本未加载，请重新加载页面。');
+    setTimeout(()=>{if(['booting','starting'].includes(root.dataset.wikiState))failed('资料库尚未启动，请重新加载，并确认浏览器允许 JavaScript。');},15000);
+  })();
+  </script>
+</body>
+</html>
