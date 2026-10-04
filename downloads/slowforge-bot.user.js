@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         暮色世界：协议选怪与自动战斗
 // @namespace    local.slowforge.bot
-// @version      0.6.2
+// @version      0.6.3
 // @downloadURL  https://429349613.github.io/slowforge-wiki/downloads/slowforge-bot.user.js
 // @updateURL    https://429349613.github.io/slowforge-wiki/downloads/slowforge-bot.user.js
 // @description  从客户端协议读取名称和血量，模拟 Tab 与技能键；Esc 停止
@@ -548,17 +548,21 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
 (function (root) {
   'use strict';
   const bundledLogin = typeof module !== 'undefined' && module.exports ? require('./login.js') : null;
-  const SCRATCH_BYTES = 1024, RECT_OFFSET = 876, SCALE_OFFSET = 5836, MAX_HIT_AGE = 300;
+  // Login's native renderer idles at roughly 1 Hz. Keep a bounded five-frame
+  // lease; every event still rechecks phase, context, memory and geometry.
+  const SCRATCH_BYTES = 1024, RECT_OFFSET = 876, SCALE_OFFSET = 5836, MAX_HIT_AGE = 5000, MAX_PRESS_AGE = 2000;
   function create(options = {}) {
     const document = options.document || root.document, now = options.now || Date.now;
     const loginAPI = () => root.SlowForgeLogin || bundledLogin;
     const memory = () => options.memory?.(), exports = () => options.exports?.(), controller = () => options.controller?.();
     let disposed = false, scratch = 0, scratchMemory = null, scratchExports = null, allocationAttempted = false;
     let lastFrame = null, generation = 0, busy = false, pointer = null, pressedOwner = null, capturedPress = null, prefs = { remember: false, autoLogin: false }, prefsAt = -Infinity, prefsBusy = false;
-    let message = '填写原账号密码后，可选择记住账号', reason = 'not-drawn', lastDraw = null;
-    const counters = { drawAttempts: 0, issuedFrames: 0, issuedButtons: 0, clicks: 0, credentialReads: 0, failures: 0 };
+    let message = '填写原账号密码后，可选择记住账号', reason = 'not-drawn', hitInvalidReason = 'not-drawn', lastDraw = null, lastEvent = null, lastRejectedEvent = null;
+    const counters = { drawAttempts: 0, issuedFrames: 0, issuedButtons: 0, clicks: 0, credentialReads: 0, failures: 0, pointerEvents: { down: 0, up: 0, move: 0, cancel: 0 }, hits: { down: 0, up: 0, move: 0 }, rejectedEvents: 0, rejections: {} };
     const bounds = (view, p, size) => Number.isInteger(p) && p > 0 && Number.isInteger(size) && size >= 0 && p + size <= view.byteLength;
-    function invalidate(code) { if (lastFrame) generation++; lastFrame = null; pointer = null; pressedOwner = null; reason = code; }
+    function invalidate(code) { if (lastFrame) generation++; lastFrame = null; pointer = null; pressedOwner = null; reason = code; hitInvalidReason = code; }
+    const frameAge = () => lastFrame ? now() - lastFrame.at : null;
+    function rejectEvent(code) { counters.rejectedEvents++; counters.rejections[code] = (counters.rejections[code] || 0) + 1; if (lastEvent) { lastEvent.reason = code; lastRejectedEvent = { ...lastEvent }; } }
     function observe() { try { return loginAPI()?.observeMemory(memory(), options.verified?.() === true) || { available: false }; } catch (_) { return { available: false }; } }
     function canvas() { return document?.getElementById?.('canvas'); }
     function safeCanvas() {
@@ -667,7 +671,8 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
       } catch (_) { counters.failures++; invalidate('native-draw-failed'); return false; }
     }
     function liveFrame() {
-      if (disposed || document?.hidden || !lastFrame || now() - lastFrame.at > MAX_HIT_AGE || now() < lastFrame.at) { pressedOwner = null; return null; }
+      hitInvalidReason = disposed ? 'disposed' : document?.hidden ? 'page-hidden' : !lastFrame ? reason : now() < lastFrame.at ? 'clock-rollback' : now() - lastFrame.at > MAX_HIT_AGE ? 'frame-expired' : null;
+      if (hitInvalidReason) { pressedOwner = null; return null; }
       const state = observe();
       if (!state.available || !state.login || state.phase !== 4 || state.context !== lastFrame.context || memory() !== lastFrame.memory || canvas() !== lastFrame.canvas) { invalidate('login-context-mismatch'); return null; }
       const c = lastFrame.canvas;
@@ -690,11 +695,11 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
       try { return new TextDecoder('utf-8', { fatal: true }).decode(copied); } finally { copied.fill(0); }
     }
     async function activate(id, frame) {
-      if (busy) return; const c = controller(); if (!c) return;
+      if (busy) { rejectEvent('controller-busy'); return; } const c = controller(); if (!c) { rejectEvent('controller-unavailable'); return; }
       busy = true; const token = generation; let account = '', password = '';
       const stillValid = () => token === generation && liveFrame()?.context === frame.context && c === controller();
       try {
-        const preference = await c.preferences(); if (!stillValid()) return;
+        const preference = await c.preferences(); if (!stillValid()) { rejectEvent('context-changed-before-action'); return; }
         if (id === 'save') {
           const view = new DataView(memory().buffer), L = loginAPI().LAYOUT;
           counters.credentialReads++; account = readString(view, frame.context, L.accountOffset, 32); password = readString(view, frame.context, L.passwordOffset, 64);
@@ -713,31 +718,40 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
       finally { account = ''; password = ''; busy = false; }
     }
     function eventHandler(event) {
+      const kind = ({ pointerdown: 'down', pointerup: 'up', pointermove: 'move' })[event.type]; if (kind) counters.pointerEvents[kind]++;
+      lastEvent = { type: event.type, reason: 'received', frameAgeMs: frameAge(), trusted: event.isTrusted === true, canvasTarget: event.target === canvas() };
       // Consume a release owned by our captured press even when the pointer has
       // moved onto an original client button or the render frame became stale.
       const releasedOwner = event.type === 'pointerup' ? capturedPress : null;
       if (releasedOwner && event.isTrusted === true && releasedOwner.pointerId === event.pointerId) { event.preventDefault?.(); event.stopImmediatePropagation?.(); }
       if (event.type === 'pointerup') capturedPress = null;
       if (event.type === 'pointerdown') capturedPress = null;
-      if (event.isTrusted !== true || event.button !== undefined && event.button !== 0) { if (event.type !== 'pointermove') pressedOwner = null; return; }
-      const frame = liveFrame(); if (!frame) return;
-      const p = position(event, frame); if (!p) { if (event.type !== 'pointermove') pressedOwner = null; return; }
+      if (event.isTrusted !== true || event.button !== undefined && event.button !== 0) { if (event.type !== 'pointermove') pressedOwner = null; rejectEvent(event.isTrusted !== true ? 'untrusted-event' : 'secondary-button'); return; }
+      const frame = liveFrame(); if (!frame) { rejectEvent(hitInvalidReason || 'frame-unavailable'); return; }
+      const p = position(event, frame); if (!p) { if (event.type !== 'pointermove') pressedOwner = null; rejectEvent(event.target !== frame.canvas ? 'other-target' : 'invalid-coordinates'); return; }
+      lastEvent.x = p.x; lastEvent.y = p.y;
       pointer = { ...p, down: event.type === 'pointerdown' };
-      if (event.type === 'pointermove') return;
       const hit = frame.buttons.find(button => p.x >= button.rect.x && p.x < button.rect.x + button.rect.w && p.y >= button.rect.y && p.y < button.rect.y + button.rect.h);
+      if (hit) { if (kind) counters.hits[kind]++; lastEvent.hitId = hit.id; }
+      if (event.type === 'pointermove') { lastEvent.reason = hit ? 'hover' : 'outside-controls'; return; }
       const owner = pressedOwner;
-      if (event.type === 'pointerdown') { pressedOwner = hit ? { id: hit.id, context: frame.context, generation: frame.generation, pointerId: event.pointerId } : null; capturedPress = hit ? { pointerId: event.pointerId } : null; }
+      if (event.type === 'pointerdown') { pressedOwner = hit ? { id: hit.id, context: frame.context, generation: frame.generation, pointerId: event.pointerId, at: now() } : null; capturedPress = hit ? { pointerId: event.pointerId } : null; }
       if (event.type === 'pointerup') pressedOwner = null;
-      if (!hit) return;
+      if (!hit) { rejectEvent('outside-controls'); return; }
       event.preventDefault?.(); event.stopImmediatePropagation?.();
-      if (event.type === 'pointerup' && owner?.id === hit.id && owner.context === frame.context && owner.generation === frame.generation && owner.pointerId === event.pointerId) { counters.clicks++; void activate(hit.id, frame); }
+      if (event.type === 'pointerdown') lastEvent.reason = 'press-owned';
+      if (event.type === 'pointerup') {
+        if (owner?.id !== hit.id || owner.context !== frame.context || owner.generation !== frame.generation || owner.pointerId !== event.pointerId) { rejectEvent('unmatched-press'); return; }
+        if (now() < owner.at || now() - owner.at > MAX_PRESS_AGE) { rejectEvent('press-expired'); return; }
+        lastEvent.reason = 'click-accepted'; counters.clicks++; void activate(hit.id, frame);
+      }
     }
-    const cancelHandler = () => { pointer = null; pressedOwner = null; capturedPress = null; };
+    const cancelHandler = () => { counters.pointerEvents.cancel++; pointer = null; pressedOwner = null; capturedPress = null; lastEvent = { type: 'pointercancel', reason: 'press-cancelled', frameAgeMs: frameAge() }; };
     for (const type of ['pointerdown', 'pointerup', 'pointermove']) document?.addEventListener?.(type, eventHandler, true);
     document?.addEventListener?.('pointercancel', cancelHandler, true);
     return {
       draw,
-      diagnostic() { const visible = !!liveFrame(), state = observe(); return { phase: state.available ? state.phase : null, login: state.available && state.login === true, visible, reason, disposed, busy, ...counters, lastDraw: lastDraw ? JSON.parse(JSON.stringify(lastDraw)) : null, rectangles: lastFrame ? { original: { ...lastFrame.original }, controls: lastFrame.buttons.map(button => ({ id: button.id, ...button.rect })) } : null }; },
+      diagnostic() { const visible = !!liveFrame(), state = observe(); return { phase: state.available ? state.phase : null, login: state.available && state.login === true, visible, documentHidden: document?.hidden === true, frameAgeMs: frameAge(), maxHitAgeMs: MAX_HIT_AGE, hitInvalidReason, reason, disposed, busy, ...JSON.parse(JSON.stringify(counters)), lastEvent: lastEvent ? { ...lastEvent } : null, lastRejectedEvent: lastRejectedEvent ? { ...lastRejectedEvent } : null, lastDraw: lastDraw ? JSON.parse(JSON.stringify(lastDraw)) : null, rectangles: lastFrame ? { original: { ...lastFrame.original }, controls: lastFrame.buttons.map(button => ({ id: button.id, ...button.rect })) } : null }; },
       dispose() {
         if (disposed) return; disposed = true; invalidate('disposed'); capturedPress = null; generation++;
         for (const type of ['pointerdown', 'pointerup', 'pointermove']) document?.removeEventListener?.(type, eventHandler, true);
@@ -749,7 +763,7 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
       }
     };
   }
-  const api = { create, SCRATCH_BYTES, MAX_HIT_AGE };
+  const api = { create, SCRATCH_BYTES, MAX_HIT_AGE, MAX_PRESS_AGE };
   root.SlowForgeNativeLoginUI = api; if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);
 
@@ -1116,7 +1130,7 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
     input.addEventListener('change',()=>{config.names=input.checked?[...new Set([...config.names,name])]:config.names.filter(x=>x!==name);persist();});l.append(input,document.createTextNode(name));parent.append(l);
   }
   function download(){
-    const snapshot=world.snapshot();const data={scriptVersion:'0.6.2',clientVersion:PATCH_MANIFEST.version,ready,status,config,packetSerial,snapshot,samples:Array.from(rawSamples.values()),basis,session,navigation,clientView,login:login?.diagnostic(),nativeUi:nativeLogin?.diagnostic(),feedback:world.combatFeedback,castFailure:world.castFailure};
+    const snapshot=world.snapshot();const data={scriptVersion:'0.6.3',clientVersion:PATCH_MANIFEST.version,ready,status,config,packetSerial,snapshot,samples:Array.from(rawSamples.values()),basis,session,navigation,clientView,login:login?.diagnostic(),nativeUi:nativeLogin?.diagnostic(),feedback:world.combatFeedback,castFailure:world.castFailure};
     const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));a.download='slowforge-diagnostic.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000);
   }
   function mount(){
@@ -1124,7 +1138,7 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
     host=document.createElement('aside');host.id='slowforge-bot-panel';ui=host.attachShadow({mode:'open'});
     ui.innerHTML=`<style>:host{position:fixed;right:12px;top:12px;z-index:2147483647;width:302px;color:#edf2f7;font:13px/1.5 system-ui}*{box-sizing:border-box}.box{padding:14px;background:#17202eef;border:1px solid #50627b;border-radius:10px;box-shadow:0 5px 25px #0009}header{font-weight:700;font-size:16px;display:flex;justify-content:space-between}button,input{font:inherit}button{cursor:pointer;border:1px solid #66758b;border-radius:5px;padding:6px 10px;color:#fff;background:#35445a}button:hover{background:#435775}button:focus-visible,input:focus-visible{outline:2px solid #73baf7}#start{background:#236849}#stop{background:#893c42}p{margin:8px 0}.row{display:flex;gap:6px;margin-top:8px;align-items:center}.grid{display:grid;grid-template-columns:1fr 95px;gap:6px;align-items:center}input[type=number],input[type=text]{width:100%;background:#0f1724;color:#fff;border:1px solid #64748b;border-radius:4px;padding:4px}#names{max-height:150px;overflow:auto;padding:7px 0}#names label{display:block}small{color:#b9c5d8}#state{white-space:pre-line;font-variant-numeric:tabular-nums}#status{color:#ade0ff;min-height:38px}#body[hidden]{display:none}</style><div class="box"><header>暮色世界 · 自动战斗<button id="fold" aria-label="收起面板">−</button></header><div id="body"><p id="status"></p><small>勾选怪物名称；按 Esc 随时停止。</small><div id="names">等待协议中的怪物名称……</div><div class="row"><input id="manual" type="text" placeholder="也可输入准确怪物名" aria-label="怪物名称"><button id="add">添加</button></div><p id="state"></p><div class="grid"><label for="keys">轮流使用技能键</label><input id="keys" type="text"><label for="range">技能距离（游戏单位）</label><input id="range" type="number" step="0.1" min="1" max="50"><label for="radius">选怪半径</label><input id="radius" type="number" min="1" max="200"><label for="minHealth">停止血量（%）</label><input id="minHealth" type="number" min="1" max="99"><label for="interval">技能间隔（毫秒）</label><input id="interval" type="number" min="450" max="10000"></div><p><label><input type="checkbox" id="approach"> 自动接近（右键寻路）</label></p><div class="row"><button id="start">开始</button><button id="stop">停止</button><button id="calibrate">校准移动</button></div><div class="row"><button id="diagnostic">导出诊断</button><small>诊断保存在本机</small></div></div></div>`;
     for(const key of ['keys','range','radius','minHealth','interval'])ui.getElementById(key).value=config[key];ui.getElementById('approach').checked=!!config.approach;
-    ui.querySelector('header').firstChild.textContent='暮色世界 · 伴侣 0.6.2';
+    ui.querySelector('header').firstChild.textContent='暮色世界 · 伴侣 0.6.3';
     ui.querySelector('label[for="keys"]').textContent='技能键顺序（例如2,3）';
     try{login=SlowForgeLogin.createController({memory:()=>memory,verified:()=>ready,clientVersion:PATCH_MANIFEST.version,nativeFocus:(context,which)=>{const s=SlowForgeLogin.observeMemory(memory,ready);if(s.available&&s.login&&s.context===context)clientExports?.SfNativeFocus?.(context,which);}});SlowForgeCompanionUI.mountLogin(ui,login,stop);nativeLogin=SlowForgeNativeLoginUI.create({memory:()=>memory,exports:()=>clientExports,controller:()=>login,verified:()=>ready,document});}catch(_){const note=document.createElement('p');note.textContent='登录保存不可用：浏览器需要支持本机加密存储。';ui.getElementById('body').append(note);}
     const library=document.createElement('p');library.innerHTML='<a href="https://429349613.github.io/slowforge-wiki/" target="_blank" rel="noopener" style="color:#ade0ff">打开带图玩家 Wiki</a>';ui.getElementById('diagnostic').parentElement.after(library);
@@ -1149,7 +1163,7 @@ const PATCH_MANIFEST={"version":"ee03106a0360282c5cd0707e","wasmSha256":"0dd91f2
     ui.getElementById('state').textContent=`${world.phase} · 消息 ${packetSerial}\n角色血量：${p?.health??'?'} / ${p?.maxHealth??'?'}\n${session.lockedGuid?'锁定目标':'目标'}：${world.name(t)||'无'} · 血量 ${t?.health??'?'} · 距离 ${Number.isFinite(world.distance(t))?world.distance(t).toFixed(1):'?'}${config.profile==='rogue'?'\n真实连击点：'+(world.comboFor(t?.guid)?.points??'待同步')+' / 5':''}`;
     const names=[...new Set([...config.names,...Array.from(world.entities.values()).filter(e=>e.kind===3).map(e=>world.name(e)).filter(Boolean)])].sort();
     const nameKey=names.join('\0');if(nameKey!==seenNames){seenNames=nameKey;const n=ui.getElementById('names');n.replaceChildren();if(!names.length)n.textContent='等待协议中的怪物名称……';for(const name of names)addName(name,n);}
-    const summary={version:'0.6.2',ready,running,status,config,session,navigation,clientView,combo:world.comboFor(t?.guid),login:login?.diagnostic(),nativeUi:nativeLogin?.diagnostic(),feedback:world.combatFeedback,castFailure:world.castFailure,phase:world.phase,packets:packetSerial,playerGuid:world.playerGuid,targetGuid:world.targetGuid,player:p?{health:p.health,maxHealth:p.maxHealth,level:p.level,position:p.position}:null,updates:world.updatePackets,names,errors:world.errors,counts:world.counts,entities:Array.from(world.entities.values()).filter(e=>e.kind===3).map(e=>({guid:e.guid,name:world.name(e),health:e.health,maxHealth:e.maxHealth,level:e.level,faction:e.faction,flags:e.flags,distance:world.distance(e),position:world.position(e)}))};
+    const summary={version:'0.6.3',ready,running,status,config,session,navigation,clientView,combo:world.comboFor(t?.guid),login:login?.diagnostic(),nativeUi:nativeLogin?.diagnostic(),feedback:world.combatFeedback,castFailure:world.castFailure,phase:world.phase,packets:packetSerial,playerGuid:world.playerGuid,targetGuid:world.targetGuid,player:p?{health:p.health,maxHealth:p.maxHealth,level:p.level,position:p.position}:null,updates:world.updatePackets,names,errors:world.errors,counts:world.counts,entities:Array.from(world.entities.values()).filter(e=>e.kind===3).map(e=>({guid:e.guid,name:world.name(e),health:e.health,maxHealth:e.maxHealth,level:e.level,faction:e.faction,flags:e.flags,distance:world.distance(e),position:world.position(e)}))};
     const serialized=JSON.stringify(summary);if(serialized!==lastSummary){lastSummary=serialized;document.getElementById('slowforge-bot-diagnostics').textContent=serialized;}
   }
   // Synthetic SDL keyboard events do not require the OS window to be focused.
